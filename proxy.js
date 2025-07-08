@@ -1,77 +1,80 @@
-    const express = require('express');
-    const app = express();
-    const http = require('http');
-    const server = http.createServer(app);
-    const { Server } = require('socket.io');
+// proxy.js
+const express = require('express');
+const cors = require('cors');
+const axios = require('axios'); // Para hacer las solicitudes HTTP/HTTPS
 
-    // --- CORS CONFIGURATION ---
-    const io = new Server(server, {
-      cors: {
-        origin: "https://thehidergame.ballongame.io", // ¡IMPORTANTE! Asegúrate que sea EXACTAMENTE tu dominio de Hostinger
-        methods: ["GET", "POST"]
-      }
-    });
+const app = express();
+const PORT = process.env.PORT || 3001; // Puedes cambiar el puerto si es necesario
 
-    // NO HAY LÍNEAS DE app.use(express.static) O app.get('/') AQUÍ.
-    // Este servidor SOLO manejará las conexiones de Socket.IO.
+// Habilitar CORS para todas las solicitudes.
+// En un entorno de producción, es recomendable restringir el origin a tu dominio.
+app.use(cors());
 
-    const players = {}; // Almacena el estado de los jugadores
+// Middleware para parsear JSON si lo necesitas (no estrictamente necesario para este caso)
+app.use(express.json());
 
-    io.on('connection', (socket) => {
-        console.log('Un usuario se ha conectado:', socket.id);
+// Ruta para manejar las solicitudes proxy
+app.all('/proxy', async (req, res) => {
+    const targetUrl = req.query.url; // La URL de destino se pasa como un parámetro 'url' en la query string
 
-        // Cuando un jugador se conecta, añade su ID y posición inicial
-        // Se corrige la altura inicial Y a 0.27 para que coincida con la base del modelo Cannon.js del cliente
-        players[socket.id] = {
-            position: { x: 0, y: 0.27, z: 0 }, // **CORREGIDO: Posición inicial Y para que el jugador esté en el suelo**
-            rotation: 0, // Rotación Y
-            pitchRotation: 0, // Rotación X de la cámara (arriba/abajo)
-            flashlightOn: true, // Estado inicial de la linterna
-            playerAnimationState: 'idle' // **AÑADIDO: Estado inicial de la animación**
+    if (!targetUrl) {
+        return res.status(400).json({ error: 'Falta el parámetro "url" en la solicitud.' });
+    }
+
+    try {
+        // Construye la URL de destino completa, incluyendo los parámetros originales
+        const originalUrl = new URL(targetUrl);
+        for (const key in req.query) {
+            if (key !== 'url') { // No incluyas el parámetro 'url' del proxy en la URL de destino
+                originalUrl.searchParams.append(key, req.query[key]);
+            }
+        }
+
+        // Configura la solicitud a la URL de destino
+        const config = {
+            method: req.method, // Usa el mismo método HTTP de la solicitud original (GET, POST, etc.)
+            url: originalUrl.toString(),
+            headers: {
+                // Opcional: Reenviar algunos encabezados de la solicitud original
+                // Ten cuidado con qué encabezados reenvías, algunos pueden causar problemas
+                'User-Agent': req.headers['user-agent'] || 'Node.js Proxy',
+                // 'Authorization': req.headers['authorization'], // Si necesitas reenviar tokens
+                // Elimina el encabezado Host para evitar problemas con algunos servidores
+                'Host': undefined
+            },
+            // Si la solicitud original tenía un cuerpo (ej. POST), reenvíalo
+            data: req.body,
+            responseType: 'arraybuffer' // Importante para manejar binarios (como streams M3U)
         };
 
-        // Envía a los jugadores actuales al nuevo jugador
-        // **CORRECCIÓN CLAVE:** Asegura que cada objeto de jugador tenga su 'id' interno
-        const playersWithIds = {};
-        for (const playerId in players) {
-            playersWithIds[playerId] = { id: playerId, ...players[playerId] };
-        }
-        socket.emit('currentPlayers', playersWithIds);
+        console.log(`Proxying request to: ${config.url}`);
 
-        // Envía el nuevo jugador (con su ID) a los otros jugadores
-        socket.broadcast.emit('playerMoved', { id: socket.id, ...players[socket.id] }); // Envía su propio estado inicial a los demás
+        const response = await axios(config);
 
-        // Cuando un jugador se mueve
-        socket.on('playerMoved', (playerData) => {
-            if (players[socket.id]) { // Asegúrate de que el jugador aún exista
-                players[socket.id].position = playerData.position;
-                players[socket.id].rotation = playerData.rotation;
-                players[socket.id].pitchRotation = playerData.pitchRotation;
-                players[socket.id].flashlightOn = playerData.flashlightOn; // Actualiza el estado de la linterna
-                players[socket.id].playerAnimationState = playerData.playerAnimationState; // **AÑADIDO: Actualiza el estado de la animación**
-
-                // Envía la actualización de la posición (con ID y nuevo estado) a todos los demás jugadores
-                socket.broadcast.emit('playerMoved', { id: socket.id, ...players[socket.id] });
+        // Reenvía los encabezados de la respuesta del servidor de destino
+        for (const key in response.headers) {
+            if (response.headers.hasOwnProperty(key)) {
+                res.setHeader(key, response.headers[key]);
             }
-        });
+        }
 
-        // Cuando un jugador envía un mensaje de chat
-        socket.on('chatMessage', (message) => {
-            console.log(`Mensaje de chat de ${socket.id}: ${message}`);
-            // Envía el mensaje a todos los clientes conectados, incluyendo el remitente
-            io.emit('chatMessage', { senderId: socket.id, text: message });
-        });
+        // Envía el código de estado y los datos de la respuesta
+        res.status(response.status).send(response.data);
 
-        // Cuando un jugador se desconecta
-        socket.on('disconnect', () => {
-            console.log('Un usuario se ha desconectado:', socket.id);
-            delete players[socket.id]; // Elimina al jugador del objeto
-            // Envía el ID del jugador desconectado a los demás para que lo eliminen de la escena
-            io.emit('playerDisconnected', socket.id);
-        });
-    });
+    } catch (error) {
+        console.error('Error en el proxy:', error.message);
+        if (error.response) {
+            // El servidor de destino respondió con un error (ej. 403, 404)
+            console.error('Respuesta de error del destino:', error.response.status, error.response.data.toString());
+            res.status(error.response.status).send(error.response.data);
+        } else {
+            // Error de red o configuración del proxy
+            res.status(500).json({ error: 'Error interno del proxy', details: error.message });
+        }
+    }
+});
 
-    const PORT = process.env.PORT || 3000;
-    server.listen(PORT, () => {
-      console.log(`Servidor de Socket.IO escuchando en el puerto ${PORT}`);
-    });
+app.listen(PORT, () => {
+    console.log(`Proxy server running on port ${PORT}`);
+    console.log(`Access it at http://localhost:${PORT}/proxy?url=YOUR_IPTV_URL`);
+});
